@@ -539,12 +539,282 @@ import flask
 import requests
 import socket
 import json
-from flask import Flask, jsonify
+from flask import Flask, jsonify, render_template_string
 
 app = Flask(__name__)
 
+# HTML template with CSS styling
+def get_html_template():
+    return """<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CS218 Load Balancer Demo</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            margin: 0;
+            padding: 20px;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            color: #333;
+        }
+        
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+        
+        .header {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+        
+        .header h1 {
+            margin: 0;
+            font-size: 2.5em;
+            font-weight: 300;
+            text-shadow: 0 2px 4px rgba(0,0,0,0.3);
+        }
+        
+        .header p {
+            margin: 10px 0 0 0;
+            font-size: 1.2em;
+            opacity: 0.9;
+        }
+        
+        .content {
+            padding: 40px;
+        }
+        
+        .status-card {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 25px;
+            margin-bottom: 30px;
+            border-left: 5px solid #4facfe;
+        }
+        
+        .status-card h2 {
+            margin: 0 0 15px 0;
+            color: #4facfe;
+            font-size: 1.5em;
+        }
+        
+        .status-success {
+            background: #d4edda;
+            border-left-color: #28a745;
+            color: #155724;
+        }
+        
+        .status-success h2 {
+            color: #28a745;
+        }
+        
+        .json-container {
+            background: #2d3748;
+            border-radius: 10px;
+            padding: 25px;
+            margin: 20px 0;
+            overflow-x: auto;
+        }
+        
+        .json-content {
+            color: #e2e8f0;
+            font-family: 'Courier New', monospace;
+            font-size: 14px;
+            line-height: 1.6;
+            white-space: pre-wrap;
+        }
+        
+        .metadata-grid {
+            display: grid;
+            grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+            gap: 20px;
+            margin-top: 20px;
+        }
+        
+        .metadata-item {
+            background: #f8f9fa;
+            padding: 20px;
+            border-radius: 8px;
+            border-left: 4px solid #4facfe;
+        }
+        
+        .metadata-item h3 {
+            margin: 0 0 10px 0;
+            color: #4facfe;
+            font-size: 1.1em;
+            text-transform: capitalize;
+        }
+        
+        .metadata-item p {
+            margin: 0;
+            color: #666;
+            word-break: break-all;
+        }
+        
+        .footer {
+            text-align: center;
+            padding: 20px;
+            background: #f8f9fa;
+            color: #666;
+            font-size: 0.9em;
+        }
+        
+        .instance-badge {
+            display: inline-block;
+            background: #4facfe;
+            color: white;
+            padding: 5px 15px;
+            border-radius: 20px;
+            font-size: 0.8em;
+            margin-left: 10px;
+        }
+        
+        @media (max-width: 768px) {
+            .container {
+                margin: 10px;
+                border-radius: 10px;
+            }
+            
+            .header h1 {
+                font-size: 2em;
+            }
+            
+            .content {
+                padding: 20px;
+            }
+            
+            .metadata-grid {
+                grid-template-columns: 1fr;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>CS218 Load Balancer Demo <span class="instance-badge">Instance {{ instance_number }}</span></h1>
+            <p>AWS Application Load Balancer with EC2 Instances</p>
+        </div>
+        
+        <div class="content">
+            <div class="status-card status-success">
+                <h2>✅ Server Status</h2>
+                <p><strong>Message:</strong> {{ message }}</p>
+                <p><strong>Hostname:</strong> {{ hostname }}</p>
+                <p><strong>Local IP:</strong> {{ local_ip }}</p>
+            </div>
+            
+            <div class="status-card">
+                <h2>📊 Instance Metadata</h2>
+                <div class="metadata-grid">
+                    {% for key, value in metadata.items() %}
+                    <div class="metadata-item">
+                        <h3>{{ key.replace('-', ' ').title() }}</h3>
+                        <p>{{ value }}</p>
+                    </div>
+                    {% endfor %}
+                </div>
+            </div>
+            
+            <div class="status-card">
+                <h2>🔍 Raw JSON Response</h2>
+                <div class="json-container">
+                    <div class="json-content">{{ json_data }}</div>
+                </div>
+            </div>
+        </div>
+        
+        <div class="footer">
+            <p>CS218 Load Balancer Demo | AWS EC2 Instance | Flask Application</p>
+        </div>
+    </div>
+</body>
+</html>"""
+
 @app.route('/')
 def instance_info():
+    try:
+        # Get instance metadata
+        metadata_url = 'http://169.254.169.254/latest/meta-data/'
+        metadata = {}
+        
+        # Get various metadata
+        metadata_fields = [
+            'instance-id',
+            'instance-type', 
+            'availability-zone',
+            'local-ipv4',
+            'public-ipv4',
+            'local-hostname',
+            'public-hostname',
+            'security-groups',
+            'iam/instance-profile'
+        ]
+        
+        for field in metadata_fields:
+            try:
+                response = requests.get(f'{metadata_url}{field}', timeout=2)
+                if response.status_code == 200:
+                    metadata[field] = response.text
+                else:
+                    metadata[field] = 'Not available'
+            except:
+                metadata[field] = 'Not available'
+        
+        # Get hostname
+        hostname = socket.gethostname()
+        
+        # Get local IP
+        local_ip = socket.gethostbyname(hostname)
+        
+        # Create response data
+        response_data = {
+            'hostname': hostname,
+            'local_ip': local_ip,
+            'metadata': metadata,
+            'message': 'Flask server running successfully!'
+        }
+        
+        # Determine instance number from hostname or instance-id
+        instance_number = "1"
+        if 'instance-2' in hostname or '2' in metadata.get('instance-id', ''):
+            instance_number = "2"
+        
+        # Pretty print JSON for display
+        json_data = json.dumps(response_data, indent=2)
+        
+        # Render HTML template
+        return render_template_string(get_html_template(), 
+                                    message=response_data['message'],
+                                    hostname=hostname,
+                                    local_ip=local_ip,
+                                    metadata=metadata,
+                                    json_data=json_data,
+                                    instance_number=instance_number)
+        
+    except Exception as e:
+        error_data = {'error': str(e)}
+        return render_template_string(get_html_template(), 
+                                    message="Error occurred",
+                                    hostname="Unknown",
+                                    local_ip="Unknown",
+                                    metadata={},
+                                    json_data=json.dumps(error_data, indent=2),
+                                    instance_number="?")
+
+@app.route('/api')
+def api_info():
+    """API endpoint that returns raw JSON (for curl testing)"""
     try:
         # Get instance metadata
         metadata_url = 'http://169.254.169.254/latest/meta-data/'

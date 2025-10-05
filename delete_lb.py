@@ -6,12 +6,17 @@ This script tears down all AWS resources created by create_lb.py.
 It identifies resources using the 'Coolscale' tag and deletes them in the proper order.
 
 Resources deleted in order:
-1. Load Balancer (must be deleted first)
-2. Target Groups
-3. EC2 Instances
-4. Security Groups
-5. Key Pairs (optional - asks for confirmation)
-6. Local PEM file (optional - asks for confirmation)
+1. Load Balancer Listeners
+2. Load Balancer (must be deleted first)
+3. Target Groups
+4. EC2 Instances
+5. Security Groups
+6. Internet Gateways
+7. Subnets
+8. VPCs
+9. Elastic IPs
+10. Key Pairs
+11. Local PEM file
 """
 
 import boto3
@@ -61,7 +66,9 @@ def find_resources_by_tag(tag_key, tag_value):
         'key_pairs': [],
         'vpcs': [],
         'subnets': [],
-        'internet_gateways': []
+        'internet_gateways': [],
+        'route_tables': [],
+        'elastic_ips': []
     }
     
     try:
@@ -146,6 +153,25 @@ def find_resources_by_tag(tag_key, tag_value):
         for igw in igws:
             resources['internet_gateways'].append(igw)
             print_status(f"Found Internet Gateway: {igw.id}")
+        
+        # Find Route Tables
+        print_status(f"Searching for Route Tables with tag {tag_key}={tag_value}...")
+        route_tables = list(ec2.route_tables.filter(Filters=[{'Name': f'tag:{tag_key}', 'Values': [tag_value]}]))
+        for rt in route_tables:
+            resources['route_tables'].append(rt)
+            print_status(f"Found Route Table: {rt.id}")
+        
+        # Find Elastic IPs
+        print_status(f"Searching for Elastic IPs with tag {tag_key}={tag_value}...")
+        eip_response = ec2_client.describe_addresses(
+            Filters=[{'Name': f'tag:{tag_key}', 'Values': [tag_value]}]
+        )
+        for eip in eip_response['Addresses']:
+            resources['elastic_ips'].append(eip)
+            public_ip = eip.get('PublicIp', 'N/A')
+            allocation_id = eip.get('AllocationId', 'N/A')
+            instance_id = eip.get('InstanceId', 'N/A')
+            print_status(f"Found Elastic IP: {public_ip} (Allocation: {allocation_id}, Instance: {instance_id})")
         
     except Exception as e:
         print_status(f"Error searching for resources: {str(e)}", "ERROR")
@@ -421,6 +447,71 @@ def delete_vpcs(vpcs):
     
     return success
 
+def delete_route_tables(route_tables):
+    """Delete custom route tables"""
+    if not route_tables:
+        print_status("No route tables to delete")
+        return True
+    
+    print_status(f"Deleting {len(route_tables)} custom route tables...")
+    success = True
+    
+    for rt in route_tables:
+        rt_id = rt.id
+        try:
+            print_status(f"Deleting route table: {rt_id}")
+            
+            # Delete the route table
+            rt.delete()
+            print_status(f"Successfully deleted route table: {rt_id}")
+            
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            if error_code == 'InvalidRouteTableID.NotFound':
+                print_status(f"Route table {rt_id} already deleted")
+            else:
+                print_status(f"Error deleting route table {rt_id}: {str(e)}", "ERROR")
+                success = False
+        except Exception as e:
+            print_status(f"Unexpected error deleting route table {rt_id}: {str(e)}", "ERROR")
+            success = False
+    
+    return success
+
+def delete_elastic_ips(elastic_ips):
+    """Delete Elastic IPs"""
+    if not elastic_ips:
+        print_status("No Elastic IPs to delete")
+        return True
+    
+    print_status(f"Deleting {len(elastic_ips)} Elastic IPs...")
+    success_count = 0
+    
+    for eip in elastic_ips:
+        allocation_id = eip.get('AllocationId')
+        public_ip = eip.get('PublicIp', 'N/A')
+        
+        try:
+            print_status(f"Releasing Elastic IP: {public_ip} (Allocation ID: {allocation_id})")
+            
+            # Release the Elastic IP
+            ec2_client.release_address(AllocationId=allocation_id)
+            print_status(f"Successfully released Elastic IP: {public_ip}")
+            success_count += 1
+            
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            if error_code == 'InvalidAllocationID.NotFound':
+                print_status(f"Elastic IP {public_ip} already released or not found")
+                success_count += 1
+            else:
+                print_status(f"Error releasing Elastic IP {public_ip}: {str(e)}", "ERROR")
+        except Exception as e:
+            print_status(f"Unexpected error releasing Elastic IP {public_ip}: {str(e)}", "ERROR")
+    
+    print_status(f"Elastic IP cleanup completed: {success_count}/{len(elastic_ips)} successfully deleted")
+    return success_count == len(elastic_ips)
+
 def delete_local_pem_file():
     """Delete local PEM file"""
     if os.path.exists(KEY_PATH):
@@ -463,6 +554,8 @@ def main():
     print_status(f"VPCs: {len(resources['vpcs'])}")
     print_status(f"Subnets: {len(resources['subnets'])}")
     print_status(f"Internet Gateways: {len(resources['internet_gateways'])}")
+    print_status(f"Route Tables: {len(resources['route_tables'])}")
+    print_status(f"Elastic IPs: {len(resources['elastic_ips'])}")
     print_status(f"Key Pairs: {len(resources['key_pairs'])}")
     print_status("="*60)
     
@@ -514,12 +607,20 @@ def main():
     print_status("STEP 8: Deleting VPCs")
     cleanup_results['vpcs'] = delete_vpcs(resources['vpcs'])
     
-    # 9. Delete Key Pairs
-    print_status("STEP 9: Deleting Key Pairs")
+    # 9. Delete Route Tables
+    print_status("STEP 9: Deleting Route Tables")
+    cleanup_results['route_tables'] = delete_route_tables(resources['route_tables'])
+    
+    # 10. Delete Elastic IPs
+    print_status("STEP 10: Deleting Elastic IPs")
+    cleanup_results['elastic_ips'] = delete_elastic_ips(resources['elastic_ips'])
+    
+    # 11. Delete Key Pairs
+    print_status("STEP 11: Deleting Key Pairs")
     cleanup_results['key_pairs'] = delete_key_pairs(resources['key_pairs'])
     
-    # 10. Delete Local PEM file
-    print_status("STEP 10: Cleaning up local files")
+    # 12. Delete Local PEM file
+    print_status("STEP 12: Cleaning up local files")
     cleanup_results['local_files'] = delete_local_pem_file()
     
     # Final summary

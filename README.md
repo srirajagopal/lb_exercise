@@ -12,6 +12,105 @@ This project creates a complete AWS load balancer infrastructure using Python bo
 
 ## Summary
 
+### Architecture Diagram
+
+```mermaid
+graph TB
+    subgraph "AWS VPC (coolscale-vpc) - 10.0.0.0/16"
+        subgraph "Availability Zone A (us-east-2a)"
+            subnet1["Public Subnet A<br/>(coolscale-subnet-us-east-2a)<br/>10.0.1.0/24"]
+            instance1["EC2 Instance 1<br/>(coolscale-instance-1)<br/>t2.micro"]
+            eip1["Elastic IP 1<br/>(coolscale-eip-instance-1)"]
+        end
+        
+        subgraph "Availability Zone B (us-east-2b)"
+            subnet2["Public Subnet B<br/>(coolscale-subnet-us-east-2b)<br/>10.0.2.0/24"]
+            instance2["EC2 Instance 2<br/>(coolscale-instance-2)<br/>t2.micro"]
+            eip2["Elastic IP 2<br/>(coolscale-eip-instance-2)"]
+        end
+        
+        rt["Custom Route Table<br/>(coolscale-rt)<br/>0.0.0.0/0 → IGW"]
+        
+        subgraph "Security Groups"
+            lb_sg["Load Balancer SG<br/>(coolscale-lb-sg)<br/>HTTP:80, HTTPS:443"]
+            instance_sg["Instance SG<br/>(coolscale-instance-sg)<br/>SSH:22, HTTP:80 from LB"]
+        end
+    end
+    
+    subgraph "Internet Gateway"
+        igw["Internet Gateway<br/>(coolscale-igw)"]
+    end
+    
+    subgraph "Application Load Balancer"
+        alb["Application Load Balancer<br/>(coolscale-lb)<br/>Internet-facing"]
+        tg["Target Group<br/>(coolscale-tg)<br/>HTTP:80 Health Check"]
+        listener["HTTP Listener<br/>Port 80"]
+    end
+    
+    subgraph "Key Management"
+        kp["EC2 Key Pair<br/>(coolscale-key)<br/>coolscale-key.pem"]
+    end
+    
+    subgraph "External Access"
+        internet["Internet Users"]
+        user["Developer SSH<br/>(via PEM key)"]
+    end
+    
+    %% Internet Gateway connections
+    internet --> igw
+    igw --> rt
+    rt --> subnet1
+    rt --> subnet2
+    
+    %% Load Balancer connections
+    internet --> alb
+    alb --> listener
+    listener --> tg
+    tg --> instance1
+    tg --> instance2
+    
+    %% Instance connections
+    instance1 --> eip1
+    instance2 --> eip2
+    instance1 -.-> subnet1
+    instance2 -.-> subnet2
+    
+    %% Security Group associations
+    alb -.-> lb_sg
+    instance1 -.-> instance_sg
+    instance2 -.-> instance_sg
+    
+    %% SSH access
+    user --> eip1
+    user --> eip2
+    eip1 --> instance1
+    eip2 --> instance2
+    
+    %% Key pair association
+    kp -.-> instance1
+    kp -.-> instance2
+    
+    %% Route table associations
+    rt -.-> subnet1
+    rt -.-> subnet2
+    
+    %% Styling
+    classDef vpc fill:#e1f5fe,stroke:#01579b,stroke-width:2px
+    classDef subnet fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
+    classDef instance fill:#e8f5e8,stroke:#1b5e20,stroke-width:2px
+    classDef lb fill:#fff3e0,stroke:#e65100,stroke-width:2px
+    classDef security fill:#fce4ec,stroke:#880e4f,stroke-width:2px
+    classDef network fill:#e0f2f1,stroke:#004d40,stroke-width:2px
+    classDef external fill:#f1f8e9,stroke:#33691e,stroke-width:2px
+    
+    class subnet1,subnet2 subnet
+    class instance1,instance2,eip1,eip2 instance
+    class alb,tg,listener lb
+    class lb_sg,instance_sg security
+    class igw,rt network
+    class internet,user,kp external
+```
+
 ### Resource Creation Order
 
 The infrastructure is created in the following order to ensure proper dependencies:
@@ -19,20 +118,22 @@ The infrastructure is created in the following order to ensure proper dependenci
 1. **VPC Creation** - Creates a custom VPC with CIDR `10.0.0.0/16`
 2. **Subnet Creation** - Creates 2 public subnets in different AZs (`10.0.1.0/24`, `10.0.2.0/24`)
 3. **Internet Gateway Setup** - Creates and attaches IGW with routing configuration
-4. **Security Groups** - Creates LB and instance security groups with appropriate rules
-5. **Key Pair** - Creates EC2 key pair and saves PEM file locally
-6. **AMI Selection** - Finds latest Amazon Linux 2 AMI
-7. **EC2 Instances** - Launches 2 instances with Flask web server in different AZs
-8. **Target Group** - Creates target group and registers EC2 instances
-9. **Load Balancer** - Creates Application Load Balancer with HTTP listener
-10. **Health Checks** - Configures health checks and waits for active state
-11. **Automated Testing** - Tests load balancer with curl and validates Flask response
+4. **Route Table Configuration** - Creates custom route table and removes blackhole routes
+5. **Security Groups** - Creates LB and instance security groups with appropriate rules
+6. **Key Pair** - Creates EC2 key pair and saves PEM file locally
+7. **AMI Selection** - Finds latest Amazon Linux 2 AMI
+8. **EC2 Instances** - Launches 2 instances with Flask web server in different AZs
+9. **Target Group** - Creates target group and registers EC2 instances
+10. **Load Balancer** - Creates Application Load Balancer with HTTP listener
+11. **Health Checks** - Configures health checks and waits for active state
+12. **Automated Testing** - Tests load balancer with curl and validates Flask response
 
 ### Infrastructure Components
 
 - **1 Custom VPC** with DNS support
 - **2 Public Subnets** in different availability zones
 - **1 Internet Gateway** with routing configuration
+- **1 Custom Route Table** with proper internet routing (no blackhole routes)
 - **2 Security Groups** (LB and instance)
 - **1 EC2 Key Pair** with local PEM file
 - **2 EC2 Instances** running Flask web servers
@@ -104,7 +205,7 @@ aws ec2 modify-subnet-attribute --subnet-id subnet-12345678 --map-public-ip-on-l
 
 ### 3. Internet Gateway Setup
 
-Creates and attaches an Internet Gateway for public internet access.
+Creates and attaches an Internet Gateway for public internet access, along with proper route table configuration.
 
 **boto3 Code:**
 ```python
@@ -119,21 +220,100 @@ igw = ec2.create_internet_gateway(
 )
 igw.attach_to_vpc(VpcId=vpc_id)
 
-# Add route to main route table
-main_route_table.create_route(
+# Create custom route table for Internet access
+custom_route_table = ec2.create_route_table(
+    VpcId=vpc_id,
+    TagSpecifications=[{
+        'ResourceType': 'route-table',
+        'Tags': [
+            {'Key': 'Name', 'Value': 'coolscale-rt'},
+            {'Key': 'Project', 'Value': 'Coolscale'}
+        ]
+    }]
+)
+
+# Remove any blackhole routes for 0.0.0.0/0
+for route in existing_routes:
+    if (route.destination_cidr_block == '0.0.0.0/0' and 
+        hasattr(route, 'gateway_id') and 
+        route.gateway_id == 'local'):
+        custom_route_table.delete_route(DestinationCidrBlock='0.0.0.0/0')
+
+# Add route to Internet Gateway
+custom_route_table.create_route(
     DestinationCidrBlock='0.0.0.0/0',
     GatewayId=igw_id
 )
+
+# Associate subnets with custom route table
+for subnet in selected_subnets:
+    custom_route_table.associate_with_subnet(SubnetId=subnet.id)
 ```
 
 **AWS CLI Equivalent:**
 ```bash
 aws ec2 create-internet-gateway --tag-specifications 'ResourceType=internet-gateway,Tags=[{Key=Name,Value=coolscale-igw},{Key=Project,Value=Coolscale}]'
 aws ec2 attach-internet-gateway --internet-gateway-id igw-12345678 --vpc-id vpc-12345678
+
+# Create custom route table
+aws ec2 create-route-table --vpc-id vpc-12345678 --tag-specifications 'ResourceType=route-table,Tags=[{Key=Name,Value=coolscale-rt},{Key=Project,Value=Coolscale}]'
+
+# Delete any blackhole routes (if they exist)
+aws ec2 delete-route --route-table-id rtb-12345678 --destination-cidr-block 0.0.0.0/0
+
+# Add route to Internet Gateway
 aws ec2 create-route --route-table-id rtb-12345678 --destination-cidr-block 0.0.0.0/0 --gateway-id igw-12345678
+
+# Associate subnets with custom route table
+aws ec2 associate-route-table --route-table-id rtb-12345678 --subnet-id subnet-12345678
+aws ec2 associate-route-table --route-table-id rtb-12345678 --subnet-id subnet-87654321
 ```
 
-### 4. Security Group Creation
+#### Route Table Configuration Details
+
+The script creates a **custom route table** to ensure proper internet connectivity:
+
+1. **Custom Route Table Creation**: Creates a dedicated route table for the VPC instead of relying on the main route table
+2. **Blackhole Route Removal**: Automatically detects and removes any blackhole routes for `0.0.0.0/0` that might prevent internet access
+3. **Internet Gateway Route**: Adds a proper route from `0.0.0.0/0` to the Internet Gateway
+4. **Subnet Association**: Associates all subnets with the custom route table to ensure internet access
+
+This approach ensures that:
+- All subnets have proper internet connectivity
+- No conflicting or blackhole routes interfere with traffic
+- The routing configuration is explicit and controlled
+- Public subnets can properly reach the internet and receive traffic from the internet
+
+### 4. Route Table Configuration
+
+The script includes comprehensive route table management to ensure proper internet connectivity.
+
+**Key Features:**
+- **Custom Route Table**: Creates a dedicated route table instead of modifying the main route table
+- **Blackhole Route Detection**: Automatically identifies and removes problematic blackhole routes
+- **Internet Gateway Routing**: Establishes proper routing to the Internet Gateway
+- **Subnet Association**: Associates all subnets with the custom route table
+
+**Blackhole Route Handling:**
+```python
+# Remove any blackhole routes for 0.0.0.0/0
+blackhole_routes_removed = 0
+for route in existing_routes:
+    if (route.destination_cidr_block == '0.0.0.0/0' and 
+        hasattr(route, 'gateway_id') and 
+        route.gateway_id == 'local'):
+        # This is a blackhole route, remove it
+        custom_route_table.delete_route(DestinationCidrBlock='0.0.0.0/0')
+        blackhole_routes_removed += 1
+```
+
+**Why This Matters:**
+- **Blackhole Routes**: Can prevent internet access even with a properly configured Internet Gateway
+- **Explicit Control**: Custom route table gives complete control over routing decisions
+- **Troubleshooting**: Makes routing configuration visible and debuggable
+- **Best Practices**: Follows AWS networking best practices for custom VPCs
+
+### 5. Security Group Creation
 
 Creates security groups for the load balancer and EC2 instances.
 
@@ -165,7 +345,7 @@ aws ec2 authorize-security-group-ingress --group-id sg-12345678 --protocol tcp -
 aws ec2 authorize-security-group-ingress --group-id sg-12345678 --protocol tcp --port 443 --cidr 0.0.0.0/0
 ```
 
-### 5. Key Pair Creation
+### 6. Key Pair Creation
 
 Creates an EC2 key pair and saves the private key locally.
 
@@ -183,7 +363,7 @@ aws ec2 create-key-pair --key-name coolscale-key --query 'KeyMaterial' --output 
 chmod 400 coolscale-key.pem
 ```
 
-### 6. EC2 Instance Launch
+### 7. EC2 Instance Launch
 
 Launches EC2 instances with user data script to install Flask web server.
 
@@ -217,7 +397,7 @@ instance = ec2.create_instances(
 aws ec2 run-instances --image-id ami-12345678 --instance-type t2.micro --key-name coolscale-key --subnet-id subnet-12345678 --security-group-ids sg-12345678 --associate-public-ip-address --user-data file://user-data.sh --tag-specifications 'ResourceType=instance,Tags=[{Key=Name,Value=coolscale-instance-1},{Key=Project,Value=Coolscale}]'
 ```
 
-### 7. Target Group Creation
+### 8. Target Group Creation
 
 Creates a target group and registers EC2 instances for load balancing.
 
@@ -249,7 +429,7 @@ aws elbv2 create-target-group --name coolscale-tg --protocol HTTP --port 80 --vp
 aws elbv2 register-targets --target-group-arn arn:aws:elasticloadbalancing:us-east-2:123456789012:targetgroup/coolscale-tg/1234567890abcdef --targets Id=i-1234567890abcdef0 Id=i-0987654321fedcba0
 ```
 
-### 8. Load Balancer Creation
+### 9. Load Balancer Creation
 
 Creates an Application Load Balancer with HTTP listener.
 
@@ -284,7 +464,7 @@ aws elbv2 create-load-balancer --name coolscale-lb --subnets subnet-12345678 sub
 aws elbv2 create-listener --load-balancer-arn arn:aws:elasticloadbalancing:us-east-2:123456789012:loadbalancer/app/coolscale-lb/1234567890abcdef --protocol HTTP --port 80 --default-actions Type=forward,TargetGroupArn=arn:aws:elasticloadbalancing:us-east-2:123456789012:targetgroup/coolscale-tg/1234567890abcdef
 ```
 
-### 11. Automated Testing
+### 10. Automated Testing
 
 The script automatically tests the load balancer to ensure it's working correctly and returning the expected Flask application response.
 

@@ -917,6 +917,11 @@ When using the `--enable-autoscaling` flag, the script creates additional resour
 - IAM Role: `coolscale-ec2-role`
 - Instance Profile: `coolscale-instance-profile`
 
+### Troubleshooting
+
+tshark -i eth0 -O http -f "tcp port 80 or tcp port 443" -Y "http.request || http.response"
+
+
 ### Idempotent Operations
 
 The `create_lb.py` script is designed to be **idempotent**, meaning it can be safely run multiple times without creating duplicate resources or causing errors. The script will:

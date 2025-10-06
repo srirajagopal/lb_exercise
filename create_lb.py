@@ -722,7 +722,7 @@ def get_html_template():
 <body>
     <div class="container">
         <div class="header">
-            <h1>CS218 Load Balancer Demo <span class="instance-badge">Instance {{ instance_number }}</span></h1>
+            <h1>CS218 Load Balancer Demo <span class="instance-badge">IP: {{ instance_number }}</span></h1>
             <p>AWS Application Load Balancer with EC2 Instances</p>
         </div>
         
@@ -805,10 +805,8 @@ def instance_info():
             'message': 'Flask server running successfully!'
         }
         
-        # Determine instance number from hostname or instance-id
-        instance_number = "1"
-        if 'instance-2' in hostname or '2' in metadata.get('instance-id', ''):
-            instance_number = "2"
+        # Use private IP as instance identifier (unique and auto-scaling friendly)
+        instance_number = local_ip
         
         # Pretty print JSON for display
         json_data = json.dumps(response_data, indent=2)
@@ -830,7 +828,7 @@ def instance_info():
                                     local_ip="Unknown",
                                     metadata={},
                                     json_data=json.dumps(error_data, indent=2),
-                                    instance_number="?")
+                                    instance_number="Unknown")
 
 @app.route('/api')
 def api_info():

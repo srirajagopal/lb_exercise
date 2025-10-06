@@ -209,6 +209,7 @@ __marimo__/
 # IDE
 .vscode/
 .idea/
+.cursorrules
 *.swp
 *.swo
 *~

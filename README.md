@@ -51,6 +51,16 @@ graph TB
         kp["EC2 Key Pair<br/>(coolscale-key)<br/>coolscale-key.pem"]
     end
     
+    subgraph "Auto Scaling (Optional)"
+        lt["Launch Template<br/>(coolscale-lt)<br/>Instance Configuration"]
+        asg["Auto Scaling Group<br/>(coolscale-asg)<br/>Min:2, Max:3, Desired:2"]
+        policy_up["Scale Up Policy<br/>(coolscale-scale-up-policy)<br/>+1 Instance"]
+        policy_down["Scale Down Policy<br/>(coolscale-scale-down-policy)<br/>-1 Instance"]
+        alarm_up["Scale Up Alarm<br/>(coolscale-scale-up)<br/>CPU > 75%"]
+        alarm_down["Scale Down Alarm<br/>(coolscale-scale-down)<br/>CPU < 30%"]
+        iam_role["IAM Role<br/>(coolscale-ec2-role)<br/>CloudWatch Permissions"]
+    end
+    
     subgraph "External Access"
         internet["Internet Users"]
         user["Developer SSH<br/>(via PEM key)"]
@@ -94,6 +104,15 @@ graph TB
     rt -.-> subnet1
     rt -.-> subnet2
     
+    %% Auto Scaling connections
+    asg --> lt
+    asg --> tg
+    alarm_up --> policy_up
+    alarm_down --> policy_down
+    policy_up --> asg
+    policy_down --> asg
+    lt -.-> iam_role
+    
     %% Styling
     classDef vpc fill:#e1f5fe,stroke:#01579b,stroke-width:2px
     classDef subnet fill:#f3e5f5,stroke:#4a148c,stroke-width:2px
@@ -102,6 +121,7 @@ graph TB
     classDef security fill:#fce4ec,stroke:#880e4f,stroke-width:2px
     classDef network fill:#e0f2f1,stroke:#004d40,stroke-width:2px
     classDef external fill:#f1f8e9,stroke:#33691e,stroke-width:2px
+    classDef autoscaling fill:#f3e5f5,stroke:#7b1fa2,stroke-width:2px
     
     class subnet1,subnet2 subnet
     class instance1,instance2,eip1,eip2 instance
@@ -109,6 +129,7 @@ graph TB
     class lb_sg,instance_sg security
     class igw,rt network
     class internet,user,kp external
+    class lt,asg,policy_up,policy_down,alarm_up,alarm_down,iam_role autoscaling
 ```
 
 ### Resource Creation Order
@@ -122,14 +143,21 @@ The infrastructure is created in the following order to ensure proper dependenci
 5. **Security Groups** - Creates LB and instance security groups with appropriate rules
 6. **Key Pair** - Creates EC2 key pair and saves PEM file locally
 7. **AMI Selection** - Finds latest Amazon Linux 2 AMI
-8. **EC2 Instances** - Launches 2 instances with Flask web server in different AZs
-9. **Target Group** - Creates target group and registers EC2 instances
-10. **Load Balancer** - Creates Application Load Balancer with HTTP listener
-11. **Health Checks** - Configures health checks and waits for active state
-12. **Automated Testing** - Tests load balancer with curl and validates Flask response
+8. **IAM Instance Profile** - Creates IAM role and instance profile with propagation wait (auto scaling mode only)
+9. **EC2 Instances** - Launches 2 instances with Flask web server in different AZs (standard mode only)
+10. **Elastic IPs** - Creates and attaches Elastic IPs to instances (standard mode only)
+11. **Target Group** - Creates target group and registers EC2 instances
+12. **Load Balancer** - Creates Application Load Balancer with HTTP listener
+13. **Launch Template** - Creates launch template with base64-encoded user data and IAM validation (auto scaling mode only)
+14. **Auto Scaling Group** - Creates ASG with min:2, max:3, desired:2 (auto scaling mode only)
+15. **Scaling Policies** - Creates scale-up and scale-down policies for ASG (auto scaling mode only, not tagged)
+16. **CloudWatch Alarms** - Creates CPU-based scaling alarms linked to policies (auto scaling mode only)
+17. **Health Checks** - Configures health checks and waits for active state
+18. **Automated Testing** - Tests load balancer with curl and validates Flask response
 
 ### Infrastructure Components
 
+#### Standard Mode:
 - **1 Custom VPC** with DNS support
 - **2 Public Subnets** in different availability zones
 - **1 Internet Gateway** with routing configuration
@@ -137,6 +165,25 @@ The infrastructure is created in the following order to ensure proper dependenci
 - **2 Security Groups** (LB and instance)
 - **1 EC2 Key Pair** with local PEM file
 - **2 EC2 Instances** running Flask web servers
+- **2 Elastic IPs** attached to instances
+- **1 Target Group** with health checks
+- **1 Application Load Balancer** with HTTP listener
+- **Automated Testing** with curl verification
+- **Idempotent Operations** - safe to re-run multiple times
+
+#### Auto Scaling Mode (--enable-autoscaling):
+- **1 Custom VPC** with DNS support
+- **2 Public Subnets** in different availability zones
+- **1 Internet Gateway** with routing configuration
+- **1 Custom Route Table** with proper internet routing (no blackhole routes)
+- **2 Security Groups** (LB and instance)
+- **1 EC2 Key Pair** with local PEM file
+- **1 Launch Template** defining instance configuration
+- **1 Auto Scaling Group** (min: 2, max: 3, desired: 2)
+- **2 Scaling Policies** (scale-up and scale-down)
+- **2 CloudWatch Alarms** for CPU-based scaling
+- **1 IAM Role** with CloudWatch permissions
+- **1 IAM Instance Profile** for EC2 instances
 - **1 Target Group** with health checks
 - **1 Application Load Balancer** with HTTP listener
 - **Automated Testing** with curl verification
@@ -523,16 +570,24 @@ The deletion script (`delete_lb.py`) removes all resources in the proper order t
 
 ### Deletion Order
 
-1. **Delete Load Balancer Listeners** - Must be deleted before load balancers
-2. **Delete Load Balancers** - Remove ALB instances
-3. **Delete Target Groups** - Remove target groups (now safe to delete)
-4. **Terminate EC2 Instances** - Stop and terminate instances
-5. **Delete Security Groups** - Remove security group rules
-6. **Delete Internet Gateways** - Detach and delete IGWs
-7. **Delete Subnets** - Remove custom subnets
-8. **Delete VPCs** - Remove custom VPC
-9. **Delete Key Pairs** - Remove EC2 key pairs
-10. **Delete Local Files** - Remove PEM files (optional)
+1. **Delete CloudWatch Alarms** - Must be deleted before Auto Scaling Groups
+2. **Delete Scaling Policies** - Remove auto scaling policies
+3. **Delete Load Balancer Listeners** - Must be deleted before load balancers
+4. **Delete Load Balancers** - Remove ALB instances
+5. **Delete Target Groups** - Remove target groups (now safe to delete)
+6. **Delete Auto Scaling Groups** - Terminates instances automatically
+7. **Terminate EC2 Instances** - Stop and terminate remaining instances
+8. **Delete Launch Templates** - Remove launch templates
+9. **Delete IAM Instance Profiles** - Remove IAM instance profiles
+10. **Delete IAM Roles** - Remove IAM roles
+11. **Delete Security Groups** - Remove security group rules
+12. **Delete Internet Gateways** - Detach and delete IGWs
+13. **Delete Subnets** - Remove custom subnets
+14. **Delete VPCs** - Remove custom VPC
+15. **Delete Route Tables** - Remove custom route tables
+16. **Release Elastic IPs** - Release Elastic IP addresses
+17. **Delete Key Pairs** - Remove EC2 key pairs
+18. **Delete Local Files** - Remove PEM files (optional)
 
 ### Usage
 
@@ -802,15 +857,65 @@ pip install boto3
 
 ### Usage
 
-**Create Infrastructure:**
+**Create Infrastructure (Standard):**
 ```bash
 python3 create_lb.py
+```
+
+**Create Infrastructure with Auto Scaling:**
+```bash
+python3 create_lb.py --enable-autoscaling
 ```
 
 **Delete Infrastructure:**
 ```bash
 python3 delete_lb.py
 ```
+
+### Auto Scaling Features
+
+When using the `--enable-autoscaling` flag, the script creates additional resources for automatic scaling:
+
+#### Auto Scaling Components:
+- **Launch Template**: Defines the configuration for new instances (same as manual instances)
+- **Auto Scaling Group**: Manages instance lifecycle (min: 2, max: 3, desired: 2)
+- **Scaling Policies**: Define how to scale up/down (add/remove 1 instance)
+- **CloudWatch Alarms**: Monitor CPU utilization and trigger scaling policies
+- **IAM Instance Profile**: Provides CloudWatch monitoring permissions
+
+#### Scaling Configuration:
+- **Scale Up**: When CPU utilization > 75% for 2 consecutive periods (2 minutes)
+- **Scale Down**: When CPU utilization < 30% for 2 consecutive periods (2 minutes)
+- **Instance Type**: t2.micro (same as manual instances)
+- **User Data**: Identical Flask application setup as manual instances
+
+#### Scaling Policy Details:
+- **Scale Up Policy**: Adds 1 instance when triggered (SimpleScaling, +1 capacity)
+- **Scale Down Policy**: Removes 1 instance when triggered (SimpleScaling, -1 capacity)
+- **Cooldown Period**: 5 minutes between scaling actions to prevent rapid scaling
+- **Policy Type**: SimpleScaling for straightforward capacity changes
+- **Alarm Actions**: CloudWatch alarms trigger the appropriate scaling policy
+- **Resource Identification**: Policies are identified by name and ASG association (not tagged due to AWS API limitations)
+- **Delete Script**: Scaling policies are found and deleted by querying the Auto Scaling Group
+- **Cooldown Management**: 5-minute cooldown prevents rapid scaling and ensures stability
+- **Policy ARNs**: CloudWatch alarms use policy ARNs for actions, not ASG ARNs directly
+- **Validation**: Launch template creation validates IAM instance profile exists before proceeding
+
+#### Key Differences from Standard Mode:
+- **No Elastic IPs**: Auto-scaled instances use dynamic IPs
+- **No Manual Instance Management**: Instances are managed by Auto Scaling Group
+- **Dynamic Scaling**: Number of instances adjusts automatically based on load
+- **Health Checks**: Auto Scaling Group performs health checks on instances
+
+#### Resource Names (Auto Scaling):
+- Launch Template: `coolscale-lt`
+- Auto Scaling Group: `coolscale-asg`
+- Scale Up Policy: `coolscale-scale-up-policy`
+- Scale Down Policy: `coolscale-scale-down-policy`
+- Scale Up Alarm: `coolscale-scale-up`
+- Scale Down Alarm: `coolscale-scale-down`
+- IAM Role: `coolscale-ec2-role`
+- Instance Profile: `coolscale-instance-profile`
 
 ### Idempotent Operations
 

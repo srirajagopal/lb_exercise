@@ -19,12 +19,16 @@ import time
 import json
 import os
 import requests
+import argparse
+import base64
 from botocore.exceptions import ClientError, WaiterError
 
 # Initialize AWS clients
 ec2 = boto3.resource('ec2')
 ec2_client = boto3.client('ec2')
 elbv2 = boto3.client('elbv2')
+autoscaling = boto3.client('autoscaling')
+cloudwatch = boto3.client('cloudwatch')
 iam = boto3.client('iam')
 
 # Get current AWS region
@@ -43,6 +47,16 @@ TG_NAME = f'{PREFIX}-tg'
 KEY_NAME = f'{PREFIX}-key'
 VPC_NAME = f'{PREFIX}-vpc'
 IGW_NAME = f'{PREFIX}-igw'
+
+# Auto Scaling constants
+LT_NAME = f'{PREFIX}-lt'
+ASG_NAME = f'{PREFIX}-asg'
+SCALE_UP_ALARM_NAME = f'{PREFIX}-scale-up'
+SCALE_DOWN_ALARM_NAME = f'{PREFIX}-scale-down'
+# Auto Scaling Group Configuration
+MAX_INSTANCES = 3  # Maximum number of instances in the Auto Scaling Group
+MIN_INSTANCES = 2  # Minimum number of instances in the Auto Scaling Group
+DESIRED_INSTANCES = 2  # Desired number of instances in the Auto Scaling Group
 
 # Global variables to store created resources
 vpc = None
@@ -64,6 +78,12 @@ tg_arn = None
 lb_arn = None
 dns_name = None
 listener_arn = None
+
+# Auto Scaling variables
+launch_template = None
+launch_template_id = None
+asg_arn = None
+asg_name = None
 
 def print_status(message, status="INFO"):
     """Print status messages with timestamps"""
@@ -1148,17 +1168,20 @@ def create_target_group():
             registered_targets = elbv2.describe_target_health(TargetGroupArn=tg_arn)
             current_target_ids = [target['Target']['Id'] for target in registered_targets['TargetHealthDescriptions']]
             
-            # Register any new instances
-            instances_to_register = [i for i in instances if i.id not in current_target_ids]
-            if instances_to_register:
-                print_status(f"Registering {len(instances_to_register)} new instances with target group...")
-                elbv2.register_targets(
-                    TargetGroupArn=tg_arn,
-                    Targets=[{'Id': i.id} for i in instances_to_register]
-                )
-                print_status(f"Registered {len(instances_to_register)} new instances")
+            # Register any new instances (only if instances exist)
+            if instances:
+                instances_to_register = [i for i in instances if i.id not in current_target_ids]
+                if instances_to_register:
+                    print_status(f"Registering {len(instances_to_register)} new instances with target group...")
+                    elbv2.register_targets(
+                        TargetGroupArn=tg_arn,
+                        Targets=[{'Id': i.id} for i in instances_to_register]
+                    )
+                    print_status(f"Registered {len(instances_to_register)} new instances")
+                else:
+                    print_status("All instances already registered with target group")
             else:
-                print_status("All instances already registered with target group")
+                print_status("No manual instances to register (auto scaling mode)")
                 
         except ClientError as e:
             if 'TargetGroupNotFound' in str(e):
@@ -1178,13 +1201,16 @@ def create_target_group():
                 tg_arn = tg_response['TargetGroups'][0]['TargetGroupArn']
                 print_status(f"Created target group: {TG_NAME} (ARN: {tg_arn})")
 
-                # Register EC2 instances to target group
-                print_status("Registering EC2 instances with target group...")
-                elbv2.register_targets(
-                    TargetGroupArn=tg_arn,
-                    Targets=[{'Id': i.id} for i in instances]
-                )
-                print_status(f"Registered {len(instances)} instances with target group")
+                # Register EC2 instances to target group (only if instances exist)
+                if instances:
+                    print_status("Registering EC2 instances with target group...")
+                    elbv2.register_targets(
+                        TargetGroupArn=tg_arn,
+                        Targets=[{'Id': i.id} for i in instances]
+                    )
+                    print_status(f"Registered {len(instances)} instances with target group")
+                else:
+                    print_status("No manual instances to register (auto scaling mode)")
             else:
                 raise
                 
@@ -1285,38 +1311,43 @@ def pretty_print_results():
         lb_details = elbv2.describe_load_balancers(LoadBalancerArns=[lb_arn])['LoadBalancers'][0]
         pretty_print("Load Balancer", lb_details)
 
-        # EC2 Instances details
-        print_status("Retrieving EC2 instance details...")
-        instance_details = [ec2_client.describe_instances(InstanceIds=[i.id])['Reservations'][0]['Instances'][0] for i in instances]
-        pretty_print("EC2 Instances", instance_details)
+        # EC2 Instances details (only if instances exist)
+        if instances:
+            print_status("Retrieving EC2 instance details...")
+            instance_details = [ec2_client.describe_instances(InstanceIds=[i.id])['Reservations'][0]['Instances'][0] for i in instances]
+            pretty_print("EC2 Instances", instance_details)
+        else:
+            print_status("No manual instances to retrieve (auto scaling mode)")
+            instance_details = []
         
         # Generate SSH commands for each instance with Elastic IP information
-        print_status("="*60)
-        print_status("SSH COMMANDS FOR EC2 INSTANCES (WITH ELASTIC IPs)", "INFO")
-        print_status("="*60)
-        for i, instance_detail in enumerate(instance_details, 1):
-            public_ip = instance_detail.get('PublicIpAddress', 'N/A')
-            instance_id = instance_detail['InstanceId']
-            az = instance_detail['Placement']['AvailabilityZone']
+        if instance_details:
+            print_status("="*60)
+            print_status("SSH COMMANDS FOR EC2 INSTANCES (WITH ELASTIC IPs)", "INFO")
+            print_status("="*60)
+            for i, instance_detail in enumerate(instance_details, 1):
+                public_ip = instance_detail.get('PublicIpAddress', 'N/A')
+                instance_id = instance_detail['InstanceId']
+                az = instance_detail['Placement']['AvailabilityZone']
             
-            # Get Elastic IP information if available
-            elastic_ip_info = ""
-            if i <= len(elastic_ips):
-                eip = elastic_ips[i-1]
-                elastic_ip_info = f" (Elastic IP: {eip['PublicIp']})"
-            
-            if public_ip != 'N/A':
-                ssh_command = f"ssh -i {key_path} ec2-user@{public_ip}"
-                print_status(f"Instance {i} ({instance_id}) in {az}:")
-                print_status(f"  Public IP: {public_ip}{elastic_ip_info}")
-                print_status(f"  SSH Command: {ssh_command}")
-                print_status("")
-            else:
-                print_status(f"Instance {i} ({instance_id}) in {az}:")
-                print_status(f"  Public IP: Not available yet{elastic_ip_info}")
-                print_status(f"  SSH Command: Not available (wait for public IP assignment)")
-                print_status("")
-        print_status("="*60)
+                # Get Elastic IP information if available
+                elastic_ip_info = ""
+                if i <= len(elastic_ips):
+                    eip = elastic_ips[i-1]
+                    elastic_ip_info = f" (Elastic IP: {eip['PublicIp']})"
+                
+                if public_ip != 'N/A':
+                    ssh_command = f"ssh -i {key_path} ec2-user@{public_ip}"
+                    print_status(f"Instance {i} ({instance_id}) in {az}:")
+                    print_status(f"  Public IP: {public_ip}{elastic_ip_info}")
+                    print_status(f"  SSH Command: {ssh_command}")
+                    print_status("")
+                else:
+                    print_status(f"Instance {i} ({instance_id}) in {az}:")
+                    print_status(f"  Public IP: Not available yet{elastic_ip_info}")
+                    print_status(f"  SSH Command: Not available (wait for public IP assignment)")
+                    print_status("")
+            print_status("="*60)
 
         # Target Group details
         print_status("Retrieving target group details...")
@@ -1337,37 +1368,68 @@ def pretty_print_results():
         print_status(f"Load Balancer DNS: {dns_name}")
         print_status(f"Load Balancer ARN: {lb_arn}")
         print_status(f"Target Group ARN: {tg_arn}")
-        print_status(f"EC2 Instance IDs: {instance_ids}")
-        print_status(f"Elastic IPs: {len(elastic_ips)} created/attached")
+        
+        # Check if auto scaling is enabled
+        if asg_arn:
+            print_status(f"Auto Scaling Group ARN: {asg_arn}")
+            print_status(f"Launch Template ID: {launch_template_id}")
+            print_status(f"Auto Scaling: Min={MIN_INSTANCES}, Max={MAX_INSTANCES}, Desired={DESIRED_INSTANCES}")
+            print_status(f"Scale Up Alarm: {SCALE_UP_ALARM_NAME}")
+            print_status(f"Scale Down Alarm: {SCALE_DOWN_ALARM_NAME}")
+        else:
+            print_status(f"EC2 Instance IDs: {instance_ids}")
+            print_status(f"Elastic IPs: {len(elastic_ips)} created/attached")
+        
         print_status(f"PEM file location: {key_path}")
         print_status("")
-        print_status("ELASTIC IP SUMMARY:")
-        for i, eip in enumerate(elastic_ips, 1):
-            print_status(f"  Instance {i}: {eip['PublicIp']} (Allocation ID: {eip['AllocationId']})")
-        print_status("")
-        print_status("SSH COMMANDS (Copy & Paste Ready):")
-        print_status(f"  Note: Make sure the PEM file has correct permissions: chmod 400 {key_path}")
-        print_status("")
-        for i, instance_detail in enumerate(instance_details, 1):
-            public_ip = instance_detail.get('PublicIpAddress', 'N/A')
-            instance_id = instance_detail['InstanceId']
-            if public_ip != 'N/A':
-                ssh_command = f"ssh -i {key_path} ec2-user@{public_ip}"
-                print_status(f"  Instance {i}: {ssh_command}")
-            else:
-                print_status(f"  Instance {i}: Public IP not available yet")
+        
+        # Only show Elastic IP summary if not using auto scaling
+        if not asg_arn and elastic_ips:
+            print_status("ELASTIC IP SUMMARY:")
+            for i, eip in enumerate(elastic_ips, 1):
+                print_status(f"  Instance {i}: {eip['PublicIp']} (Allocation ID: {eip['AllocationId']})")
+            print_status("")
+        # Only show SSH commands if not using auto scaling
+        if not asg_arn and instance_details:
+            print_status("SSH COMMANDS (Copy & Paste Ready):")
+            print_status(f"  Note: Make sure the PEM file has correct permissions: chmod 400 {key_path}")
+            print_status("")
+            for i, instance_detail in enumerate(instance_details, 1):
+                public_ip = instance_detail.get('PublicIpAddress', 'N/A')
+                instance_id = instance_detail['InstanceId']
+                if public_ip != 'N/A':
+                    ssh_command = f"ssh -i {key_path} ec2-user@{public_ip}"
+                    print_status(f"  Instance {i}: {ssh_command}")
+                else:
+                    print_status(f"  Instance {i}: Public IP not available yet")
+        else:
+            print_status("SSH ACCESS (Auto Scaling):")
+            print_status(f"  Note: Auto scaling instances use dynamic IPs")
+            print_status(f"  Use AWS Console or 'aws ec2 describe-instances' to get current IPs")
+            print_status(f"  SSH command: ssh -i {key_path} ec2-user@<dynamic-ip>")
         print_status("")
         print_status("TESTING COMMANDS:")
         print_status(f"  Test Flask app: curl http://{dns_name}")
-        print_status(f"  Test specific instance: curl http://<instance-public-ip>")
-        if elastic_ips:
-            print_status("  Test with Elastic IPs:")
-            for i, eip in enumerate(elastic_ips, 1):
-                print_status(f"    Instance {i}: curl http://{eip['PublicIp']}")
+        
+        if not asg_arn:
+            print_status(f"  Test specific instance: curl http://<instance-public-ip>")
+            if elastic_ips:
+                print_status("  Test with Elastic IPs:")
+                for i, eip in enumerate(elastic_ips, 1):
+                    print_status(f"    Instance {i}: curl http://{eip['PublicIp']}")
+        else:
+            print_status("  Auto Scaling: Test via load balancer DNS only")
+            print_status("  Individual instances have dynamic IPs")
         print_status("="*60)
         print_status("You can now access your Flask application via the load balancer DNS name!")
         print_status("Each request will show which instance is serving the request.")
-        print_status("Elastic IPs provide static IP addresses that won't change on instance restart.")
+        
+        if not asg_arn:
+            print_status("Elastic IPs provide static IP addresses that won't change on instance restart.")
+        else:
+            print_status("Auto scaling will automatically adjust the number of instances based on CPU usage.")
+            print_status(f"Instances will scale up when CPU > 75% and scale down when CPU < 30%.")
+            print_status(f"Instance range: {MIN_INSTANCES} to {MAX_INSTANCES} instances.")
         
     except Exception as e:
         print_status(f"Error retrieving final details: {str(e)}", "ERROR")
@@ -1459,8 +1521,355 @@ def test_load_balancer():
     
     print_status("="*60)
 
+def create_launch_template():
+    """Create launch template for auto scaling"""
+    global launch_template, launch_template_id
+    
+    print_status(f"Checking for existing launch template: {LT_NAME}")
+    
+    # Validate that IAM instance profile exists
+    instance_profile_name = f'{PREFIX}-instance-profile'
+    try:
+        iam.get_instance_profile(InstanceProfileName=instance_profile_name)
+        print_status(f"Verified IAM instance profile exists: {instance_profile_name}")
+    except ClientError as e:
+        print_status(f"Error: IAM instance profile {instance_profile_name} not found", "ERROR")
+        raise Exception(f"IAM instance profile {instance_profile_name} must be created before launch template")
+    
+    try:
+        # Check if launch template already exists
+        try:
+            lt_response = ec2_client.describe_launch_templates(
+                LaunchTemplateNames=[LT_NAME]
+            )
+            launch_template_id = lt_response['LaunchTemplates'][0]['LaunchTemplateId']
+            print_status(f"Found existing launch template: {LT_NAME} (ID: {launch_template_id})")
+        except ClientError as e:
+            if 'InvalidLaunchTemplateName.NotFound' in str(e):
+                # Launch template doesn't exist, create it
+                print_status(f"Creating launch template: {LT_NAME}")
+                
+                # Create launch template with base64-encoded user data
+                user_data_script = get_user_data_script()
+                user_data_encoded = base64.b64encode(user_data_script.encode('utf-8')).decode('utf-8')
+                
+                lt_response = ec2_client.create_launch_template(
+                    LaunchTemplateName=LT_NAME,
+                    LaunchTemplateData={
+                        'ImageId': ami,
+                        'InstanceType': 't2.micro',
+                        'KeyName': KEY_NAME,
+                        'UserData': user_data_encoded,
+                        'SecurityGroupIds': [instance_sg.id],
+                        'TagSpecifications': [{
+                            'ResourceType': 'instance',
+                            'Tags': [
+                                {'Key': 'Name', 'Value': f'{PREFIX}-asg-instance'},
+                                {'Key': 'Project', 'Value': TAG_VALUE},
+                                {'Key': 'AutoScaling', 'Value': 'true'}
+                            ]
+                        }],
+                        'IamInstanceProfile': {
+                            'Name': f'{PREFIX}-instance-profile'
+                        }
+                    },
+                    TagSpecifications=[{
+                        'ResourceType': 'launch-template',
+                        'Tags': [
+                            {'Key': 'Name', 'Value': LT_NAME},
+                            {'Key': 'Project', 'Value': TAG_VALUE}
+                        ]
+                    }]
+                )
+                launch_template_id = lt_response['LaunchTemplate']['LaunchTemplateId']
+                print_status(f"Created launch template: {LT_NAME} (ID: {launch_template_id})")
+            else:
+                raise
+                
+    except Exception as e:
+        print_status(f"Failed to create/retrieve launch template: {str(e)}", "ERROR")
+        raise
+
+def create_auto_scaling_group():
+    """Create auto scaling group"""
+    global asg_arn, asg_name
+    
+    print_status(f"Checking for existing auto scaling group: {ASG_NAME}")
+    try:
+        # Check if auto scaling group already exists
+        try:
+            asg_response = autoscaling.describe_auto_scaling_groups(
+                AutoScalingGroupNames=[ASG_NAME]
+            )
+            if asg_response['AutoScalingGroups']:
+                asg_arn = asg_response['AutoScalingGroups'][0]['AutoScalingGroupARN']
+                asg_name = asg_response['AutoScalingGroups'][0]['AutoScalingGroupName']
+                print_status(f"Found existing auto scaling group: {ASG_NAME} (ARN: {asg_arn})")
+            else:
+                raise ClientError({'Error': {'Code': 'AutoScalingGroupNotFound', 'Message': 'Not found'}}, 'DescribeAutoScalingGroups')
+        except ClientError as e:
+            if 'AutoScalingGroupNotFound' in str(e):
+                # Auto scaling group doesn't exist, create it
+                print_status(f"Creating auto scaling group: {ASG_NAME}")
+                
+                asg_response = autoscaling.create_auto_scaling_group(
+                    AutoScalingGroupName=ASG_NAME,
+                    LaunchTemplate={
+                        'LaunchTemplateId': launch_template_id,
+                        'Version': '$Latest'
+                    },
+                    MinSize=MIN_INSTANCES,
+                    MaxSize=MAX_INSTANCES,
+                    DesiredCapacity=DESIRED_INSTANCES,
+                    TargetGroupARNs=[tg_arn],
+                    VPCZoneIdentifier=','.join(subnet_ids),
+                    Tags=[
+                        {
+                            'Key': 'Name',
+                            'Value': ASG_NAME,
+                            'PropagateAtLaunch': False
+                        },
+                        {
+                            'Key': 'Project',
+                            'Value': TAG_VALUE,
+                            'PropagateAtLaunch': False
+                        }
+                    ]
+                )
+                asg_name = ASG_NAME
+                print_status(f"Created auto scaling group: {ASG_NAME}")
+                
+                # Wait for instances to be launched
+                print_status("Waiting for auto scaling group instances to launch...")
+                time.sleep(30)
+                
+                # Get the ARN
+                asg_details = autoscaling.describe_auto_scaling_groups(
+                    AutoScalingGroupNames=[ASG_NAME]
+                )
+                asg_arn = asg_details['AutoScalingGroups'][0]['AutoScalingGroupARN']
+                
+            else:
+                raise
+                
+    except Exception as e:
+        print_status(f"Failed to create/retrieve auto scaling group: {str(e)}", "ERROR")
+        raise
+
+def create_scaling_policies():
+    """Create scaling policies for auto scaling group"""
+    print_status("Creating scaling policies for auto scaling...")
+    
+    # Validate that required variables are set
+    if not asg_name:
+        print_status("Error: Auto Scaling Group name not available", "ERROR")
+        raise Exception("Auto Scaling Group name not available. Cannot create scaling policies.")
+    
+    try:
+        # Create scale-up policy
+        scale_up_policy_name = f'{PREFIX}-scale-up-policy'
+        print_status(f"Creating scale-up policy: {scale_up_policy_name}")
+        
+        scale_up_response = autoscaling.put_scaling_policy(
+            AutoScalingGroupName=asg_name,
+            PolicyName=scale_up_policy_name,
+            PolicyType='SimpleScaling',
+            AdjustmentType='ChangeInCapacity',
+            ScalingAdjustment=1,
+            Cooldown=300  # 5 minutes cooldown
+        )
+        scale_up_policy_arn = scale_up_response['PolicyARN']
+        print_status(f"Created scale-up policy: {scale_up_policy_arn}")
+        
+        # Create scale-down policy
+        scale_down_policy_name = f'{PREFIX}-scale-down-policy'
+        print_status(f"Creating scale-down policy: {scale_down_policy_name}")
+        
+        scale_down_response = autoscaling.put_scaling_policy(
+            AutoScalingGroupName=asg_name,
+            PolicyName=scale_down_policy_name,
+            PolicyType='SimpleScaling',
+            AdjustmentType='ChangeInCapacity',
+            ScalingAdjustment=-1,
+            Cooldown=300  # 5 minutes cooldown
+        )
+        scale_down_policy_arn = scale_down_response['PolicyARN']
+        print_status(f"Created scale-down policy: {scale_down_policy_arn}")
+        
+        print_status("Note: Scaling policies are identified by name and associated with Auto Scaling Group")
+        
+        return scale_up_policy_arn, scale_down_policy_arn
+        
+    except Exception as e:
+        print_status(f"Failed to create scaling policies: {str(e)}", "ERROR")
+        raise
+
+def create_cloudwatch_alarms():
+    """Create CloudWatch alarms for auto scaling"""
+    print_status("Creating CloudWatch alarms for auto scaling...")
+    
+    # Validate that required variables are set
+    if not asg_name:
+        print_status("Error: Auto Scaling Group name not available", "ERROR")
+        raise Exception("Auto Scaling Group name not available. Cannot create CloudWatch alarms.")
+    
+    try:
+        # Create scaling policies first
+        scale_up_policy_arn, scale_down_policy_arn = create_scaling_policies()
+        
+        # Create scale-up alarm (CPU > 75%)
+        print_status(f"Creating scale-up alarm: {SCALE_UP_ALARM_NAME}")
+        cloudwatch.put_metric_alarm(
+            AlarmName=SCALE_UP_ALARM_NAME,
+            ComparisonOperator='GreaterThanThreshold',
+            EvaluationPeriods=2,
+            MetricName='CPUUtilization',
+            Namespace='AWS/EC2',
+            Period=60,
+            Statistic='Average',
+            Threshold=75.0,
+            ActionsEnabled=True,
+            AlarmActions=[scale_up_policy_arn],
+            AlarmDescription='Scale up when CPU utilization is greater than 75%',
+            Dimensions=[
+                {
+                    'Name': 'AutoScalingGroupName',
+                    'Value': asg_name
+                }
+            ],
+            Tags=[
+                {'Key': 'Name', 'Value': SCALE_UP_ALARM_NAME},
+                {'Key': 'Project', 'Value': TAG_VALUE}
+            ]
+        )
+        print_status(f"Created scale-up alarm: {SCALE_UP_ALARM_NAME}")
+        
+        # Create scale-down alarm (CPU < 30%)
+        print_status(f"Creating scale-down alarm: {SCALE_DOWN_ALARM_NAME}")
+        cloudwatch.put_metric_alarm(
+            AlarmName=SCALE_DOWN_ALARM_NAME,
+            ComparisonOperator='LessThanThreshold',
+            EvaluationPeriods=2,
+            MetricName='CPUUtilization',
+            Namespace='AWS/EC2',
+            Period=60,
+            Statistic='Average',
+            Threshold=30.0,
+            ActionsEnabled=True,
+            AlarmActions=[scale_down_policy_arn],
+            AlarmDescription='Scale down when CPU utilization is less than 30%',
+            Dimensions=[
+                {
+                    'Name': 'AutoScalingGroupName',
+                    'Value': asg_name
+                }
+            ],
+            Tags=[
+                {'Key': 'Name', 'Value': SCALE_DOWN_ALARM_NAME},
+                {'Key': 'Project', 'Value': TAG_VALUE}
+            ]
+        )
+        print_status(f"Created scale-down alarm: {SCALE_DOWN_ALARM_NAME}")
+        
+    except Exception as e:
+        print_status(f"Failed to create CloudWatch alarms: {str(e)}", "ERROR")
+        raise
+
+def create_iam_instance_profile():
+    """Create IAM instance profile for auto scaling instances"""
+    print_status("Creating IAM instance profile for auto scaling...")
+    
+    try:
+        profile_name = f'{PREFIX}-instance-profile'
+        
+        # Check if instance profile already exists
+        try:
+            iam.get_instance_profile(InstanceProfileName=profile_name)
+            print_status(f"Found existing instance profile: {profile_name}")
+        except ClientError as e:
+            if 'NoSuchEntity' in str(e):
+                # Create IAM role for EC2 instances
+                role_name = f'{PREFIX}-ec2-role'
+                try:
+                    iam.get_role(RoleName=role_name)
+                    print_status(f"Found existing IAM role: {role_name}")
+                except ClientError:
+                    print_status(f"Creating IAM role: {role_name}")
+                    iam.create_role(
+                        RoleName=role_name,
+                        AssumeRolePolicyDocument=json.dumps({
+                            'Version': '2012-10-17',
+                            'Statement': [{
+                                'Effect': 'Allow',
+                                'Principal': {'Service': 'ec2.amazonaws.com'},
+                                'Action': 'sts:AssumeRole'
+                            }]
+                        }),
+                        Tags=[
+                            {'Key': 'Name', 'Value': role_name},
+                            {'Key': 'Project', 'Value': TAG_VALUE}
+                        ]
+                    )
+                    
+                    # Attach CloudWatch agent policy
+                    iam.attach_role_policy(
+                        RoleName=role_name,
+                        PolicyArn='arn:aws:iam::aws:policy/CloudWatchAgentServerPolicy'
+                    )
+                    print_status(f"Created IAM role: {role_name}")
+                
+                # Create instance profile
+                print_status(f"Creating instance profile: {profile_name}")
+                iam.create_instance_profile(
+                    InstanceProfileName=profile_name,
+                    Tags=[
+                        {'Key': 'Name', 'Value': profile_name},
+                        {'Key': 'Project', 'Value': TAG_VALUE}
+                    ]
+                )
+                
+                # Add role to instance profile
+                iam.add_role_to_instance_profile(
+                    InstanceProfileName=profile_name,
+                    RoleName=role_name
+                )
+                print_status(f"Created instance profile: {profile_name}")
+                
+                # Wait a moment for IAM propagation
+                print_status("Waiting for IAM instance profile to propagate...")
+                time.sleep(10)
+                
+                # Verify the instance profile was created successfully
+                try:
+                    iam.get_instance_profile(InstanceProfileName=profile_name)
+                    print_status(f"Verified instance profile creation: {profile_name}")
+                except ClientError as e:
+                    print_status(f"Error verifying instance profile creation: {str(e)}", "ERROR")
+                    raise Exception(f"Failed to verify IAM instance profile {profile_name} creation")
+            else:
+                raise
+                
+    except Exception as e:
+        print_status(f"Failed to create IAM instance profile: {str(e)}", "ERROR")
+        raise
+
+def parse_arguments():
+    """Parse command line arguments"""
+    parser = argparse.ArgumentParser(
+        description='Create AWS Load Balancer Infrastructure with optional Auto Scaling'
+    )
+    parser.add_argument(
+        '--enable-autoscaling',
+        action='store_true',
+        help=f'Enable auto scaling for the load balancer (min: {MIN_INSTANCES}, max: {MAX_INSTANCES} instances)'
+    )
+    return parser.parse_args()
+
 if __name__ == "__main__":
     try:
+        # Parse command line arguments
+        args = parse_arguments()
+        
         # Step 1: Validate AWS region
         validate_aws_region()
         
@@ -1478,32 +1887,59 @@ if __name__ == "__main__":
         # Step 5: Find AMI
         find_ami()
         
-        # Step 6: Create EC2 instances
-        create_ec2_instances()
+        # Step 6: Create IAM instance profile (for auto scaling if enabled)
+        if args.enable_autoscaling:
+            create_iam_instance_profile()
         
-        # Step 7: Create and attach Elastic IPs to instances
-        create_and_attach_elastic_ips()
+        # Step 7: Create EC2 instances (only if auto scaling is not enabled)
+        if not args.enable_autoscaling:
+            create_ec2_instances()
+            # Step 8: Create and attach Elastic IPs to instances
+            create_and_attach_elastic_ips()
         
-        # Step 8: Create target group
+        # Step 9: Create target group
         create_target_group()
         
-        # Step 9: Create load balancer
+        # Step 10: Create load balancer
         create_load_balancer()
         
-        # Step 10: Create listener
+        # Step 11: Create listener
         create_listener()
         
-        # Step 11: Wait for LB to be active
+        # Step 12: Create auto scaling components (if enabled)
+        if args.enable_autoscaling:
+            print_status("="*60)
+            print_status("ENABLING AUTO SCALING", "INFO")
+            print_status("="*60)
+            
+            # Create launch template
+            create_launch_template()
+            
+            # Create auto scaling group
+            create_auto_scaling_group()
+            
+            # Create CloudWatch alarms
+            create_cloudwatch_alarms()
+            
+            print_status("="*60)
+            print_status("AUTO SCALING CONFIGURATION COMPLETED", "SUCCESS")
+            print_status("="*60)
+            print_status(f"Auto Scaling Group: Min={MIN_INSTANCES}, Max={MAX_INSTANCES}, Desired={DESIRED_INSTANCES}")
+            print_status("Scale Up: CPU > 75% for 2 periods (2 minutes)")
+            print_status("Scale Down: CPU < 30% for 2 periods (2 minutes)")
+            print_status("="*60)
+        
+        # Step 13: Wait for LB to be active
         print_status("Waiting for load balancer to become active...")
         if not wait_for_resource(elbv2.get_waiter('load_balancer_available'), LoadBalancerArns=[lb_arn]):
             print_status("Failed to wait for load balancer to become active", "ERROR")
             raise Exception("Load balancer failed to become active")
         print_status("Load balancer is now active and ready to serve traffic")
         
-        # Step 12: Pretty print results
+        # Step 14: Pretty print results
         pretty_print_results()
         
-        # Step 13: Test the load balancer
+        # Step 15: Test the load balancer
         test_load_balancer()
         
     except Exception as e:

@@ -6,17 +6,23 @@ This script tears down all AWS resources created by create_lb.py.
 It identifies resources using the 'Coolscale' tag and deletes them in the proper order.
 
 Resources deleted in order:
-1. Load Balancer Listeners
-2. Load Balancer (must be deleted first)
-3. Target Groups
-4. EC2 Instances
-5. Security Groups
-6. Internet Gateways
-7. Subnets
-8. VPCs
-9. Elastic IPs
-10. Key Pairs
-11. Local PEM file
+1. CloudWatch Alarms (auto scaling)
+2. Load Balancer Listeners
+3. Load Balancer (must be deleted first)
+4. Target Groups
+5. Auto Scaling Groups (terminates instances automatically)
+6. EC2 Instances (manual instances)
+7. Launch Templates
+8. IAM Instance Profiles
+9. IAM Roles
+10. Security Groups
+11. Internet Gateways
+12. Subnets
+13. VPCs
+14. Route Tables
+15. Elastic IPs
+16. Key Pairs
+17. Local PEM file
 """
 
 import boto3
@@ -29,6 +35,9 @@ from botocore.exceptions import ClientError, WaiterError
 ec2 = boto3.resource('ec2')
 ec2_client = boto3.client('ec2')
 elbv2 = boto3.client('elbv2')
+autoscaling = boto3.client('autoscaling')
+cloudwatch = boto3.client('cloudwatch')
+iam = boto3.client('iam')
 
 # Configuration
 TAG_KEY = 'Project'
@@ -68,7 +77,13 @@ def find_resources_by_tag(tag_key, tag_value):
         'subnets': [],
         'internet_gateways': [],
         'route_tables': [],
-        'elastic_ips': []
+        'elastic_ips': [],
+        'auto_scaling_groups': [],
+        'launch_templates': [],
+        'cloudwatch_alarms': [],
+        'scaling_policies': [],
+        'iam_roles': [],
+        'iam_instance_profiles': []
     }
     
     try:
@@ -172,6 +187,93 @@ def find_resources_by_tag(tag_key, tag_value):
             allocation_id = eip.get('AllocationId', 'N/A')
             instance_id = eip.get('InstanceId', 'N/A')
             print_status(f"Found Elastic IP: {public_ip} (Allocation: {allocation_id}, Instance: {instance_id})")
+        
+        # Find Auto Scaling Groups
+        print_status(f"Searching for Auto Scaling Groups with tag {tag_key}={tag_value}...")
+        try:
+            asg_response = autoscaling.describe_auto_scaling_groups()
+            for asg in asg_response['AutoScalingGroups']:
+                try:
+                    tags_response = autoscaling.describe_tags(
+                        Filters=[{'Name': 'auto-scaling-group', 'Values': [asg['AutoScalingGroupName']]}]
+                    )
+                    for tag_desc in tags_response['Tags']:
+                        if tag_desc['Key'] == tag_key and tag_desc['Value'] == tag_value:
+                            resources['auto_scaling_groups'].append(asg)
+                            print_status(f"Found Auto Scaling Group: {asg['AutoScalingGroupName']} ({asg['AutoScalingGroupARN']})")
+                except ClientError as e:
+                    print_status(f"Error checking Auto Scaling Group tags: {str(e)}", "WARNING")
+        except ClientError as e:
+            print_status(f"Error searching for Auto Scaling Groups: {str(e)}", "WARNING")
+        
+        # Find Launch Templates
+        print_status(f"Searching for Launch Templates with name pattern {PREFIX}...")
+        try:
+            lt_response = ec2_client.describe_launch_templates(
+                Filters=[{'Name': 'tag:Project', 'Values': [tag_value]}]
+            )
+            for lt in lt_response['LaunchTemplates']:
+                resources['launch_templates'].append(lt)
+                print_status(f"Found Launch Template: {lt['LaunchTemplateName']} ({lt['LaunchTemplateId']})")
+        except ClientError as e:
+            print_status(f"Error searching for Launch Templates: {str(e)}", "WARNING")
+        
+        # Find CloudWatch Alarms
+        print_status(f"Searching for CloudWatch Alarms with tag {tag_key}={tag_value}...")
+        try:
+            alarm_response = cloudwatch.describe_alarms()
+            for alarm in alarm_response['MetricAlarms']:
+                # Check if alarm name matches our pattern
+                if alarm['AlarmName'].startswith(PREFIX):
+                    resources['cloudwatch_alarms'].append(alarm)
+                    print_status(f"Found CloudWatch Alarm: {alarm['AlarmName']}")
+        except ClientError as e:
+            print_status(f"Error searching for CloudWatch Alarms: {str(e)}", "WARNING")
+        
+        # Find Scaling Policies
+        print_status(f"Searching for Auto Scaling Policies with name pattern {PREFIX}...")
+        try:
+            for asg in resources['auto_scaling_groups']:
+                asg_name = asg['AutoScalingGroupName']
+                policies_response = autoscaling.describe_policies(AutoScalingGroupName=asg_name)
+                for policy in policies_response['ScalingPolicies']:
+                    if policy['PolicyName'].startswith(PREFIX):
+                        resources['scaling_policies'].append(policy)
+                        print_status(f"Found Scaling Policy: {policy['PolicyName']} ({policy['PolicyARN']})")
+        except ClientError as e:
+            print_status(f"Error searching for Scaling Policies: {str(e)}", "WARNING")
+        
+        # Find IAM Roles
+        print_status(f"Searching for IAM Roles with tag {tag_key}={tag_value}...")
+        try:
+            role_response = iam.list_roles()
+            for role in role_response['Roles']:
+                try:
+                    tags_response = iam.list_role_tags(RoleName=role['RoleName'])
+                    for tag in tags_response['Tags']:
+                        if tag['Key'] == tag_key and tag['Value'] == tag_value:
+                            resources['iam_roles'].append(role)
+                            print_status(f"Found IAM Role: {role['RoleName']} ({role['Arn']})")
+                except ClientError as e:
+                    print_status(f"Error checking IAM Role tags: {str(e)}", "WARNING")
+        except ClientError as e:
+            print_status(f"Error searching for IAM Roles: {str(e)}", "WARNING")
+        
+        # Find IAM Instance Profiles
+        print_status(f"Searching for IAM Instance Profiles with tag {tag_key}={tag_value}...")
+        try:
+            profile_response = iam.list_instance_profiles()
+            for profile in profile_response['InstanceProfiles']:
+                try:
+                    tags_response = iam.list_instance_profile_tags(InstanceProfileName=profile['InstanceProfileName'])
+                    for tag in tags_response['Tags']:
+                        if tag['Key'] == tag_key and tag['Value'] == tag_value:
+                            resources['iam_instance_profiles'].append(profile)
+                            print_status(f"Found IAM Instance Profile: {profile['InstanceProfileName']} ({profile['Arn']})")
+                except ClientError as e:
+                    print_status(f"Error checking IAM Instance Profile tags: {str(e)}", "WARNING")
+        except ClientError as e:
+            print_status(f"Error searching for IAM Instance Profiles: {str(e)}", "WARNING")
         
     except Exception as e:
         print_status(f"Error searching for resources: {str(e)}", "ERROR")
@@ -531,6 +633,229 @@ def delete_local_pem_file():
         print_status(f"Local PEM file {KEY_PATH} not found")
         return True
 
+def delete_cloudwatch_alarms(cloudwatch_alarms):
+    """Delete CloudWatch alarms"""
+    if not cloudwatch_alarms:
+        print_status("No CloudWatch alarms found to delete")
+        return True
+    
+    print_status(f"Deleting {len(cloudwatch_alarms)} CloudWatch alarms...")
+    success = True
+    
+    for alarm in cloudwatch_alarms:
+        alarm_name = alarm['AlarmName']
+        try:
+            print_status(f"Deleting CloudWatch alarm: {alarm_name}")
+            cloudwatch.delete_alarms(AlarmNames=[alarm_name])
+            print_status(f"CloudWatch alarm {alarm_name} deleted successfully")
+            
+        except ClientError as e:
+            print_status(f"Error deleting CloudWatch alarm {alarm_name}: {str(e)}", "ERROR")
+            success = False
+        except Exception as e:
+            print_status(f"Unexpected error deleting CloudWatch alarm {alarm_name}: {str(e)}", "ERROR")
+            success = False
+    
+    return success
+
+def delete_scaling_policies(scaling_policies):
+    """Delete Auto Scaling Policies"""
+    if not scaling_policies:
+        print_status("No Auto Scaling Policies found to delete")
+        return True
+    
+    print_status(f"Deleting {len(scaling_policies)} Auto Scaling Policies...")
+    success = True
+    
+    for policy in scaling_policies:
+        policy_name = policy['PolicyName']
+        asg_name = policy['AutoScalingGroupName']
+        
+        try:
+            print_status(f"Deleting Auto Scaling Policy: {policy_name}")
+            autoscaling.delete_policy(
+                AutoScalingGroupName=asg_name,
+                PolicyName=policy_name
+            )
+            print_status(f"Auto Scaling Policy {policy_name} deleted successfully")
+            
+        except ClientError as e:
+            print_status(f"Error deleting Auto Scaling Policy {policy_name}: {str(e)}", "ERROR")
+            success = False
+        except Exception as e:
+            print_status(f"Unexpected error deleting Auto Scaling Policy {policy_name}: {str(e)}", "ERROR")
+            success = False
+    
+    return success
+
+def delete_auto_scaling_groups(auto_scaling_groups):
+    """Delete Auto Scaling Groups"""
+    if not auto_scaling_groups:
+        print_status("No Auto Scaling Groups found to delete")
+        return True
+    
+    success = True
+    for asg in auto_scaling_groups:
+        asg_name = asg['AutoScalingGroupName']
+        asg_arn = asg['AutoScalingGroupARN']
+        
+        try:
+            print_status(f"Deleting Auto Scaling Group: {asg_name}")
+            
+            # Set desired capacity to 0 and min size to 0 to terminate all instances
+            autoscaling.update_auto_scaling_group(
+                AutoScalingGroupName=asg_name,
+                MinSize=0,
+                MaxSize=0,
+                DesiredCapacity=0
+            )
+            print_status(f"Set Auto Scaling Group {asg_name} capacity to 0")
+            
+            # Wait for instances to terminate
+            print_status(f"Waiting for Auto Scaling Group {asg_name} instances to terminate...")
+            time.sleep(30)
+            
+            # Delete the Auto Scaling Group
+            autoscaling.delete_auto_scaling_group(
+                AutoScalingGroupName=asg_name,
+                ForceDelete=True
+            )
+            print_status(f"Auto Scaling Group {asg_name} deleted successfully")
+            
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            if error_code == 'AutoScalingGroupNotFound':
+                print_status(f"Auto Scaling Group {asg_name} already deleted")
+            else:
+                print_status(f"Error deleting Auto Scaling Group {asg_name}: {str(e)}", "ERROR")
+                success = False
+        except Exception as e:
+            print_status(f"Unexpected error deleting Auto Scaling Group {asg_name}: {str(e)}", "ERROR")
+            success = False
+    
+    return success
+
+def delete_launch_templates(launch_templates):
+    """Delete Launch Templates"""
+    if not launch_templates:
+        print_status("No Launch Templates found to delete")
+        return True
+    
+    success = True
+    for lt in launch_templates:
+        lt_name = lt['LaunchTemplateName']
+        lt_id = lt['LaunchTemplateId']
+        
+        try:
+            print_status(f"Deleting Launch Template: {lt_name}")
+            ec2_client.delete_launch_template(LaunchTemplateName=lt_name)
+            print_status(f"Launch Template {lt_name} deleted successfully")
+            
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            if error_code == 'InvalidLaunchTemplateName.NotFound':
+                print_status(f"Launch Template {lt_name} already deleted")
+            else:
+                print_status(f"Error deleting Launch Template {lt_name}: {str(e)}", "ERROR")
+                success = False
+        except Exception as e:
+            print_status(f"Unexpected error deleting Launch Template {lt_name}: {str(e)}", "ERROR")
+            success = False
+    
+    return success
+
+def delete_iam_instance_profiles(iam_instance_profiles):
+    """Delete IAM Instance Profiles"""
+    if not iam_instance_profiles:
+        print_status("No IAM Instance Profiles found to delete")
+        return True
+    
+    success = True
+    for profile in iam_instance_profiles:
+        profile_name = profile['InstanceProfileName']
+        
+        try:
+            print_status(f"Deleting IAM Instance Profile: {profile_name}")
+            
+            # Remove roles from instance profile first
+            for role in profile['Roles']:
+                try:
+                    iam.remove_role_from_instance_profile(
+                        InstanceProfileName=profile_name,
+                        RoleName=role['RoleName']
+                    )
+                    print_status(f"Removed role {role['RoleName']} from instance profile {profile_name}")
+                except ClientError as e:
+                    print_status(f"Error removing role from instance profile: {str(e)}", "WARNING")
+            
+            # Delete the instance profile
+            iam.delete_instance_profile(InstanceProfileName=profile_name)
+            print_status(f"IAM Instance Profile {profile_name} deleted successfully")
+            
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            if error_code == 'NoSuchEntity':
+                print_status(f"IAM Instance Profile {profile_name} already deleted")
+            else:
+                print_status(f"Error deleting IAM Instance Profile {profile_name}: {str(e)}", "ERROR")
+                success = False
+        except Exception as e:
+            print_status(f"Unexpected error deleting IAM Instance Profile {profile_name}: {str(e)}", "ERROR")
+            success = False
+    
+    return success
+
+def delete_iam_roles(iam_roles):
+    """Delete IAM Roles"""
+    if not iam_roles:
+        print_status("No IAM Roles found to delete")
+        return True
+    
+    success = True
+    for role in iam_roles:
+        role_name = role['RoleName']
+        
+        try:
+            print_status(f"Deleting IAM Role: {role_name}")
+            
+            # Detach policies first
+            try:
+                attached_policies = iam.list_attached_role_policies(RoleName=role_name)
+                for policy in attached_policies['AttachedPolicies']:
+                    iam.detach_role_policy(
+                        RoleName=role_name,
+                        PolicyArn=policy['PolicyArn']
+                    )
+                    print_status(f"Detached policy {policy['PolicyArn']} from role {role_name}")
+            except ClientError as e:
+                print_status(f"Error detaching policies from role: {str(e)}", "WARNING")
+            
+            # Delete inline policies
+            try:
+                inline_policies = iam.list_role_policies(RoleName=role_name)
+                for policy_name in inline_policies['PolicyNames']:
+                    iam.delete_role_policy(RoleName=role_name, PolicyName=policy_name)
+                    print_status(f"Deleted inline policy {policy_name} from role {role_name}")
+            except ClientError as e:
+                print_status(f"Error deleting inline policies: {str(e)}", "WARNING")
+            
+            # Delete the role
+            iam.delete_role(RoleName=role_name)
+            print_status(f"IAM Role {role_name} deleted successfully")
+            
+        except ClientError as e:
+            error_code = e.response['Error']['Code']
+            if error_code == 'NoSuchEntity':
+                print_status(f"IAM Role {role_name} already deleted")
+            else:
+                print_status(f"Error deleting IAM Role {role_name}: {str(e)}", "ERROR")
+                success = False
+        except Exception as e:
+            print_status(f"Unexpected error deleting IAM Role {role_name}: {str(e)}", "ERROR")
+            success = False
+    
+    return success
+
 def main():
     """Main cleanup function"""
     print_status("="*60)
@@ -550,6 +875,12 @@ def main():
     print_status(f"Load Balancers: {len(resources['load_balancers'])}")
     print_status(f"Target Groups: {len(resources['target_groups'])}")
     print_status(f"EC2 Instances: {len(resources['instances'])}")
+    print_status(f"Auto Scaling Groups: {len(resources['auto_scaling_groups'])}")
+    print_status(f"Launch Templates: {len(resources['launch_templates'])}")
+    print_status(f"CloudWatch Alarms: {len(resources['cloudwatch_alarms'])}")
+    print_status(f"Scaling Policies: {len(resources['scaling_policies'])}")
+    print_status(f"IAM Roles: {len(resources['iam_roles'])}")
+    print_status(f"IAM Instance Profiles: {len(resources['iam_instance_profiles'])}")
     print_status(f"Security Groups: {len(resources['security_groups'])}")
     print_status(f"VPCs: {len(resources['vpcs'])}")
     print_status(f"Subnets: {len(resources['subnets'])}")
@@ -575,52 +906,76 @@ def main():
     # Delete resources in proper order
     cleanup_results = {}
     
-    # 1. Delete Listeners first (must be deleted before load balancers)
-    print_status("STEP 1: Deleting Load Balancer Listeners")
+    # 1. Delete CloudWatch Alarms first (must be deleted before Auto Scaling Groups)
+    print_status("STEP 1: Deleting CloudWatch Alarms")
+    cleanup_results['cloudwatch_alarms'] = delete_cloudwatch_alarms(resources['cloudwatch_alarms'])
+    
+    # 2. Delete Scaling Policies (must be deleted before Auto Scaling Groups)
+    print_status("STEP 2: Deleting Auto Scaling Policies")
+    cleanup_results['scaling_policies'] = delete_scaling_policies(resources['scaling_policies'])
+    
+    # 3. Delete Listeners (must be deleted before load balancers)
+    print_status("STEP 3: Deleting Load Balancer Listeners")
     cleanup_results['listeners'] = delete_listeners(resources['load_balancers'])
     
-    # 2. Delete Load Balancers
-    print_status("STEP 2: Deleting Load Balancers")
+    # 4. Delete Load Balancers
+    print_status("STEP 4: Deleting Load Balancers")
     cleanup_results['load_balancers'] = delete_load_balancers(resources['load_balancers'])
     
-    # 3. Delete Target Groups
-    print_status("STEP 3: Deleting Target Groups")
+    # 5. Delete Target Groups
+    print_status("STEP 5: Deleting Target Groups")
     cleanup_results['target_groups'] = delete_target_groups(resources['target_groups'])
     
-    # 4. Terminate EC2 Instances
-    print_status("STEP 4: Terminating EC2 Instances")
+    # 6. Delete Auto Scaling Groups (terminates instances automatically)
+    print_status("STEP 6: Deleting Auto Scaling Groups")
+    cleanup_results['auto_scaling_groups'] = delete_auto_scaling_groups(resources['auto_scaling_groups'])
+    
+    # 7. Terminate remaining EC2 Instances (manual instances)
+    print_status("STEP 7: Terminating EC2 Instances")
     cleanup_results['instances'] = delete_ec2_instances(resources['instances'])
     
-    # 5. Delete Security Groups
-    print_status("STEP 5: Deleting Security Groups")
+    # 8. Delete Launch Templates
+    print_status("STEP 8: Deleting Launch Templates")
+    cleanup_results['launch_templates'] = delete_launch_templates(resources['launch_templates'])
+    
+    # 9. Delete IAM Instance Profiles
+    print_status("STEP 9: Deleting IAM Instance Profiles")
+    cleanup_results['iam_instance_profiles'] = delete_iam_instance_profiles(resources['iam_instance_profiles'])
+    
+    # 10. Delete IAM Roles
+    print_status("STEP 10: Deleting IAM Roles")
+    cleanup_results['iam_roles'] = delete_iam_roles(resources['iam_roles'])
+    
+    # 11. Delete Security Groups
+    print_status("STEP 11: Deleting Security Groups")
     cleanup_results['security_groups'] = delete_security_groups(resources['security_groups'])
     
-    # 6. Delete Internet Gateways
-    print_status("STEP 6: Deleting Internet Gateways")
+    # 12. Delete Internet Gateways
+    print_status("STEP 12: Deleting Internet Gateways")
     cleanup_results['internet_gateways'] = delete_internet_gateways(resources['internet_gateways'])
     
-    # 7. Delete Subnets
-    print_status("STEP 7: Deleting Subnets")
+    # 13. Delete Subnets
+    print_status("STEP 13: Deleting Subnets")
     cleanup_results['subnets'] = delete_subnets(resources['subnets'])
     
-    # 8. Delete VPCs
-    print_status("STEP 8: Deleting VPCs")
+    # 14. Delete VPCs
+    print_status("STEP 14: Deleting VPCs")
     cleanup_results['vpcs'] = delete_vpcs(resources['vpcs'])
     
-    # 9. Delete Route Tables
-    print_status("STEP 9: Deleting Route Tables")
+    # 15. Delete Route Tables
+    print_status("STEP 15: Deleting Route Tables")
     cleanup_results['route_tables'] = delete_route_tables(resources['route_tables'])
     
-    # 10. Delete Elastic IPs
-    print_status("STEP 10: Deleting Elastic IPs")
+    # 16. Delete Elastic IPs
+    print_status("STEP 16: Deleting Elastic IPs")
     cleanup_results['elastic_ips'] = delete_elastic_ips(resources['elastic_ips'])
     
-    # 11. Delete Key Pairs
-    print_status("STEP 11: Deleting Key Pairs")
+    # 17. Delete Key Pairs
+    print_status("STEP 17: Deleting Key Pairs")
     cleanup_results['key_pairs'] = delete_key_pairs(resources['key_pairs'])
     
-    # 12. Delete Local PEM file
-    print_status("STEP 12: Cleaning up local files")
+    # 18. Delete Local PEM file
+    print_status("STEP 18: Cleaning up local files")
     cleanup_results['local_files'] = delete_local_pem_file()
     
     # Final summary

@@ -922,8 +922,11 @@ When using the `--enable-autoscaling` flag, the script creates additional resour
 You can instpect the requests and response in the EC2 instance either through tcpdump or tshark (you have to install wireshark first for tshark). 
 
 ```bash
-tshark -i eth0 -O http -f "tcp port 80 or tcp port 443" -Y "http.request || http.response"
 sudo tcpdump -i eth0 -A -s 0 'not host 169.254.169.254 and tcp port 80 and (((ip[2:2] - ((ip[0]&0xf)<<2)) - ((tcp[12]&0xf0)>>2)) != 0)'
+```
+
+```bash
+tshark -i eth0 -O http -f "tcp port 80 or tcp port 443" -Y "http.request || http.response"
 ```
 
 ### Idempotent Operations

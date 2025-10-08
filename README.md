@@ -931,7 +931,7 @@ sudo tshark -i eth0 -O http -f "tcp port 80 or tcp port 443" -Y "http.request ||
 ```bash
 sudo amazon-linux-extras install epel -y
 sudo yum install stress -y
-'''
+```
 
 ### Idempotent Operations
 

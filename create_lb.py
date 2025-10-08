@@ -1674,7 +1674,7 @@ def create_scaling_policies():
             PolicyType='SimpleScaling',
             AdjustmentType='ChangeInCapacity',
             ScalingAdjustment=1,
-            Cooldown=300  # 5 minutes cooldown
+            Cooldown=60  # 1 minutes cooldown
         )
         scale_up_policy_arn = scale_up_response['PolicyARN']
         print_status(f"Created scale-up policy: {scale_up_policy_arn}")
@@ -1689,7 +1689,7 @@ def create_scaling_policies():
             PolicyType='SimpleScaling',
             AdjustmentType='ChangeInCapacity',
             ScalingAdjustment=-1,
-            Cooldown=300  # 5 minutes cooldown
+            Cooldown=60  # 1 minutes cooldown
         )
         scale_down_policy_arn = scale_down_response['PolicyARN']
         print_status(f"Created scale-down policy: {scale_down_policy_arn}")
@@ -1720,10 +1720,10 @@ def create_cloudwatch_alarms():
         cloudwatch.put_metric_alarm(
             AlarmName=SCALE_UP_ALARM_NAME,
             ComparisonOperator='GreaterThanThreshold',
-            EvaluationPeriods=2,
+            EvaluationPeriods=1,
             MetricName='CPUUtilization',
             Namespace='AWS/EC2',
-            Period=60,
+            Period=20,
             Statistic='Average',
             Threshold=75.0,
             ActionsEnabled=True,
@@ -1747,10 +1747,10 @@ def create_cloudwatch_alarms():
         cloudwatch.put_metric_alarm(
             AlarmName=SCALE_DOWN_ALARM_NAME,
             ComparisonOperator='LessThanThreshold',
-            EvaluationPeriods=2,
+            EvaluationPeriods=1,
             MetricName='CPUUtilization',
             Namespace='AWS/EC2',
-            Period=60,
+            Period=20,
             Statistic='Average',
             Threshold=30.0,
             ActionsEnabled=True,
@@ -1923,8 +1923,8 @@ if __name__ == "__main__":
             print_status("AUTO SCALING CONFIGURATION COMPLETED", "SUCCESS")
             print_status("="*60)
             print_status(f"Auto Scaling Group: Min={MIN_INSTANCES}, Max={MAX_INSTANCES}, Desired={DESIRED_INSTANCES}")
-            print_status("Scale Up: CPU > 75% for 2 periods (2 minutes)")
-            print_status("Scale Down: CPU < 30% for 2 periods (2 minutes)")
+            print_status("Scale Up: CPU > 75% for 1 period (20 seconds)")
+            print_status("Scale Down: CPU < 30% for 1 period (20 seconds)")
             print_status("="*60)
         
         # Step 13: Wait for LB to be active

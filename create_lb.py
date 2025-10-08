@@ -1674,7 +1674,7 @@ def create_scaling_policies():
             PolicyType='SimpleScaling',
             AdjustmentType='ChangeInCapacity',
             ScalingAdjustment=1,
-            Cooldown=60  # 1 minutes cooldown
+            Cooldown=300  # 5 minutes cooldown
         )
         scale_up_policy_arn = scale_up_response['PolicyARN']
         print_status(f"Created scale-up policy: {scale_up_policy_arn}")
@@ -1689,7 +1689,7 @@ def create_scaling_policies():
             PolicyType='SimpleScaling',
             AdjustmentType='ChangeInCapacity',
             ScalingAdjustment=-1,
-            Cooldown=60  # 1 minutes cooldown
+            Cooldown=300  # 5 minutes cooldown
         )
         scale_down_policy_arn = scale_down_response['PolicyARN']
         print_status(f"Created scale-down policy: {scale_down_policy_arn}")
@@ -1723,9 +1723,9 @@ def create_cloudwatch_alarms():
             EvaluationPeriods=1,
             MetricName='CPUUtilization',
             Namespace='AWS/EC2',
-            Period=20,
+            Period=60,
             Statistic='Average',
-            Threshold=75.0,
+            Threshold=50.0,
             ActionsEnabled=True,
             AlarmActions=[scale_up_policy_arn],
             AlarmDescription='Scale up when CPU utilization is greater than 75%',
@@ -1750,7 +1750,7 @@ def create_cloudwatch_alarms():
             EvaluationPeriods=1,
             MetricName='CPUUtilization',
             Namespace='AWS/EC2',
-            Period=20,
+            Period=60,
             Statistic='Average',
             Threshold=30.0,
             ActionsEnabled=True,
@@ -1923,8 +1923,8 @@ if __name__ == "__main__":
             print_status("AUTO SCALING CONFIGURATION COMPLETED", "SUCCESS")
             print_status("="*60)
             print_status(f"Auto Scaling Group: Min={MIN_INSTANCES}, Max={MAX_INSTANCES}, Desired={DESIRED_INSTANCES}")
-            print_status("Scale Up: CPU > 75% for 1 period (20 seconds)")
-            print_status("Scale Down: CPU < 30% for 1 period (20 seconds)")
+            print_status("Scale Up: CPU > 50% for 1 period (60 seconds)")
+            print_status("Scale Down: CPU < 30% for 1 period (60 seconds)")
             print_status("="*60)
         
         # Step 13: Wait for LB to be active

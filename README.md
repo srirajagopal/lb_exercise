@@ -926,8 +926,12 @@ sudo tcpdump -i eth0 -A -s 0 'not host 169.254.169.254 and tcp port 80 and (((ip
 ```
 
 ```bash
-tshark -i eth0 -O http -f "tcp port 80 or tcp port 443" -Y "http.request || http.response"
+sudo tshark -i eth0 -O http -f "tcp port 80 or tcp port 443" -Y "http.request || http.response"
 ```
+```bash
+sudo amazon-linux-extras install epel -y
+sudo yum install stress -y
+'''
 
 ### Idempotent Operations
 

@@ -984,7 +984,7 @@ def create_ec2_instances():
                 print_status(f"Creating first instance in subnet {subnet_ids[0]} ({selected_subnets[0].availability_zone})")
                 instance1 = ec2.create_instances(
                     ImageId=ami,
-                    InstanceType='t2.micro',
+                    InstanceType='t3.micro',
                     KeyName=KEY_NAME,
                     MinCount=1,
                     MaxCount=1,
@@ -1012,7 +1012,7 @@ def create_ec2_instances():
                 print_status(f"Creating second instance in subnet {subnet_ids[1]} ({selected_subnets[1].availability_zone})")
                 instance2 = ec2.create_instances(
                     ImageId=ami,
-                    InstanceType='t2.micro',
+                    InstanceType='t3.micro',
                     KeyName=KEY_NAME,
                     MinCount=1,
                     MaxCount=1,
@@ -1555,7 +1555,7 @@ def create_launch_template():
                     LaunchTemplateName=LT_NAME,
                     LaunchTemplateData={
                         'ImageId': ami,
-                        'InstanceType': 't2.micro',
+                        'InstanceType': 't3.micro',
                         'KeyName': KEY_NAME,
                         'UserData': user_data_encoded,
                         'SecurityGroupIds': [instance_sg.id],

@@ -958,7 +958,11 @@ def main():
     print_status("STEP 13: Deleting Subnets")
     cleanup_results['subnets'] = delete_subnets(resources['subnets'])
     
-    # 14. Delete VPCs
+    # 14. Delete Route Tables
+    print_status("STEP 15: Deleting Route Tables")
+    cleanup_results['route_tables'] = delete_route_tables(resources['route_tables'])
+    
+    # 15. Delete VPCs
     print_status("STEP 14: Deleting VPCs")
     cleanup_results['vpcs'] = delete_vpcs(resources['vpcs'])
     
